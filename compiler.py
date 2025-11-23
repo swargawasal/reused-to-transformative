@@ -42,9 +42,13 @@ AI_FAST_MODE = os.getenv("AI_FAST_MODE", "no").lower() == "yes"
 FACE_ENHANCEMENT = os.getenv("FACE_ENHANCEMENT", "yes").lower() == "yes"
 USE_ADVANCED_ENGINE = os.getenv("USE_ADVANCED_ENGINE", "off").lower() == "on"
 
-TEMP_DIR = "temp"
-OUTPUT_DIR = "merged_videos"
-TOOLS_DIR = os.path.join(os.getcwd(), "tools")
+# Use absolute paths to avoid Colab cwd issues
+TEMP_DIR = os.path.abspath("temp")
+OUTPUT_DIR = os.path.abspath("merged_videos")
+TOOLS_DIR = os.path.abspath(os.path.join(os.getcwd(), "tools"))
+MODELS_DIR = os.path.abspath(os.path.join(os.getcwd(), "models"))
+HEAVY_MODELS_DIR = os.path.abspath(os.path.join(MODELS_DIR, "heavy"))
+
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -108,6 +112,25 @@ def ensure_ncnn_tools_exist() -> Dict[str, bool]:
         
     return status
 
+def ensure_ncnn_available() -> bool:
+    """
+    Check if NCNN binaries are available and warn if missing.
+    Returns True if Real-ESRGAN (critical tool) is available.
+    """
+    tools = ensure_ncnn_tools_exist()
+    
+    if not tools["realesrgan"]:
+        logger.warning("⚠️ Real-ESRGAN NCNN missing. Install failed. Falling back to CPU.")
+        return False
+    
+    if not tools["srmd"]:
+        logger.warning("⚠️ SRMD NCNN missing. Some enhancement steps will be skipped.")
+    
+    if not tools["esrnet"]:
+        logger.warning("⚠️ ESRNet NCNN missing. Some enhancement steps will be skipped.")
+    
+    return True
+
 def detect_cuda_vram() -> float:
     """
     Detect CUDA VRAM in GB.
@@ -117,9 +140,13 @@ def detect_cuda_vram() -> float:
         import torch
         if torch.cuda.is_available():
             p = torch.cuda.get_device_properties(0)
-            return p.total_memory / (1024**3)
-    except:
-        return 0.0
+            vram_gb = p.total_memory / (1024**3)
+            logger.info(f"✅ CUDA GPU detected: {vram_gb:.2f}GB VRAM")
+            return vram_gb
+    except ImportError:
+        logger.info("ℹ️ PyTorch not installed. Skipping GPU detection.")
+    except Exception as e:
+        logger.warning(f"⚠️ GPU detection failed: {e}")
     return 0.0
 
 # ==================== ENGINE 1: HEAVY (PYTORCH) ====================
@@ -127,31 +154,43 @@ def detect_cuda_vram() -> float:
 def run_heavy_engine(input_path: str, output_path: str, scale: int) -> bool:
     """
     Heavy Engine Pipeline (PyTorch):
-    1. ESRNet x4 (Cleanup)
-    2. Real-ESRGAN x4plus (Detail)
-    3. SRMD (Refinement)
-    4. CodeFormer/GFPGAN (Full Frame Face Enhancement)
+    1. Load Real-ESRGAN x4plus model
+    2. Process video frames with GPU acceleration
+    3. Apply CodeFormer for face enhancement (if enabled)
     """
     logger.info("🚀 Starting HEAVY ENGINE (PyTorch)...")
     try:
-        # Placeholder for actual PyTorch implementation
-        # In a real scenario, this would load models and run inference loop
-        # For now, we simulate it or fallback if models missing
+        # Check if model weights exist
+        realesrgan_model = os.path.join(HEAVY_MODELS_DIR, "RealESRGAN_x4plus.pth")
+        codeformer_model = os.path.join(HEAVY_MODELS_DIR, "codeformer.pth")
         
-        # Check if we actually have the heavy models downloaded
-        # If not, we can't run this engine even if GPU is good
-        # For this implementation, we will assume if we got here, we try.
+        if not os.path.exists(realesrgan_model):
+            logger.warning("⚠️ RealESRGAN model weights not found. Run tools-install.py to download.")
+            return False
+        
+        # Check if PyTorch is available
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                logger.warning("⚠️ CUDA not available for Heavy Engine.")
+                return False
+        except ImportError:
+            logger.warning("⚠️ PyTorch not installed. Cannot use Heavy Engine.")
+            return False
         
         # TODO: Implement actual PyTorch inference code here
-        # Since we don't have the weights in the repo, we can't actually run this.
-        # We will return False to trigger fallback to NCNN for now, 
-        # unless user has manually set up the environment.
+        # This would involve:
+        # 1. Loading the Real-ESRGAN model from realesrgan_model path
+        # 2. Extracting frames from input_path
+        # 3. Processing each frame through the model
+        # 4. Optionally applying CodeFormer for face enhancement
+        # 5. Reassembling frames into output_path
         
-        logger.warning("⚠️ Heavy Engine implementation pending model weights. Falling back to NCNN.")
+        logger.warning("⚠️ Heavy Engine implementation pending. Falling back to NCNN.")
         return False
         
     except Exception as e:
-        logger.error(f"Heavy Engine Failed: {e}")
+        logger.warning(f"⚠️ Heavy Engine failed: {e}. Falling back to NCNN.")
         return False
 
 # ==================== ENGINE 2: NCNN (VULKAN) ====================
@@ -174,12 +213,12 @@ def run_ncnn_engine(input_path: str, output_path: str, scale: int) -> bool:
     3. Real-ESRGAN-ncnn (Detail/Upscale)
     """
     logger.info("🟢 Starting NCNN ENGINE (Vulkan)...")
-    tools = ensure_ncnn_tools_exist()
     
-    # Verify critical tools
-    if not tools["realesrgan"]:
-        logger.error("❌ Critical Tool Missing: Real-ESRGAN NCNN")
+    # Check if NCNN tools are available
+    if not ensure_ncnn_available():
         return False
+    
+    tools = ensure_ncnn_tools_exist()
 
     work_dir = os.path.join(TEMP_DIR, f"ncnn_{random.randint(1000,9999)}")
     frames_src = os.path.join(work_dir, "src")
@@ -238,7 +277,7 @@ def run_ncnn_engine(input_path: str, output_path: str, scale: int) -> bool:
             return False
 
     except Exception as e:
-        logger.error(f"NCNN Engine Error: {e}")
+        logger.warning(f"⚠️ NCNN Engine error: {e}. Falling back to CPU.")
         return False
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -270,39 +309,39 @@ def enhance_video_cpu_fallback(input_path: str, output_path: str, scale: int) ->
             return True
         return False
     except Exception as e:
-        logger.error(f"CPU Fallback Failed: {e}")
+        logger.warning(f"⚠️ CPU Fallback error: {e}. Using basic FFmpeg scale.")
         return False
 
 def enhance_video_auto(input_path: str, output_path: str, scale: int = 2) -> bool:
     """
     Automatic Engine Selection (4-Stage Hybrid):
-    1. Heavy Engine (PyTorch) - if CUDA & VRAM >= 6GB
-    2. NCNN Engine (Vulkan) - Default
-    3. Old CPU Fallback - if NCNN fails
-    4. FFmpeg Scale - Last resort
+    - On Linux (Colab) with GPU: Heavy Engine -> NCNN -> CPU -> FFmpeg
+    - On Windows or no GPU: NCNN -> CPU -> FFmpeg
+    
+    Always continues pipeline even if enhancement fails.
     """
+    is_linux = platform.system() == "Linux"
     vram = detect_cuda_vram()
     
-    # 1. Try Heavy Engine
-    if vram >= 6.0:
-        logger.info(f"⚡ High-End GPU Detected ({vram:.2f}GB). Attempting Heavy Engine...")
+    # Strategy 1: Linux/Colab with GPU - prefer Heavy Engine
+    if is_linux and vram >= 6.0:
+        logger.info(f"⚡ Linux GPU detected ({vram:.2f}GB). Attempting Heavy Engine...")
         if run_heavy_engine(input_path, output_path, scale):
             return True
         logger.warning("⚠️ Heavy Engine failed/unavailable. Falling back to NCNN.")
-    else:
-        logger.info(f"ℹ️ VRAM ({vram:.2f}GB) < 6GB. Skipping Heavy Engine.")
-        
-    # 2. NCNN Engine (Default/Fallback)
+    
+    # Strategy 2: Try NCNN (works on both Windows and Linux)
     if run_ncnn_engine(input_path, output_path, scale):
         return True
     logger.warning("⚠️ NCNN Engine failed. Falling back to CPU Engine.")
         
-    # 3. Old CPU Fallback
+    # Strategy 3: CPU Fallback (FFmpeg filters)
     if enhance_video_cpu_fallback(input_path, output_path, scale):
         return True
-    logger.warning("⚠️ CPU Engine failed. Falling back to FFmpeg Scale.")
+    logger.warning("⚠️ CPU Engine failed. Using basic FFmpeg scale.")
 
-    # 4. FFmpeg Fallback (Last Resort)
+    # Strategy 4: FFmpeg Fallback (Last Resort - always succeeds)
+    logger.info("ℹ️ Using basic FFmpeg scaling (no AI enhancement).")
     _upscale_ffmpeg(input_path, output_path, scale)
     return True
 
